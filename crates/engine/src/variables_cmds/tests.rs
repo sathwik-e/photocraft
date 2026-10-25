@@ -700,3 +700,52 @@ fn define_rejects_what_photoshop_does_not_offer() {
     define(&mut s, json!([{"name": "show", "layer": title.0, "type": "visibility"}, {"name": "head", "layer": title.0, "type": "textReplacement"}])).unwrap();
     assert_eq!(doc(&s).variables.defs.len(), 2, "a rejected define leaves the previous definitions");
 }
+
+#[test]
+fn import_options_name_rows_and_add_to_existing_sets() {
+    let (mut s, _p, badge, title) = session();
+    s.execute(
+        "image.variables.define",
+        json!({"defs": [{"name": "showBadge", "layer": badge.0, "type": "visibility"}, {"name": "headline", "layer": title.0, "type": "textReplacement"}]}),
+    )
+    .unwrap();
+    let dir = tmp("import-options");
+    let f = format!("{dir}/sets.csv");
+    // The first header cell is a variable-like name, so only the option makes it the names.
+    std::fs::write(&f, "label,showBadge,headline\nA,true,One\nB,false,Two\n").unwrap();
+    s.execute("file.import.variableDataSets", json!({"path": f, "firstColumnNames": true})).unwrap();
+    let names = |s: &Session| doc(s).variables.data_sets.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&s), ["A", "B"]);
+    s.execute("file.import.variableDataSets", json!({"path": f, "firstColumnNames": true, "replace": false})).unwrap();
+    assert_eq!(names(&s), ["A", "B", "A 2", "B 2"], "added sets keep names distinct");
+    s.execute("file.import.variableDataSets", json!({"path": f, "firstColumnNames": false})).unwrap();
+    assert_eq!(names(&s), ["Data Set 1", "Data Set 2"], "replaced, rows numbered");
+}
+
+#[test]
+fn dialog_import_reads_unsaved_definitions_and_stores_nothing() {
+    let (s, _p, badge, title) = session();
+    let defs = json!([{"name": "showBadge", "layer": badge.0, "type": "visibility"}, {"name": "headline", "layer": title.0, "type": "textReplacement"}]);
+    let sets = data_sets_from_text(doc(&s), &defs, "DataSet\tshowBadge\theadline\nA\tfalse\tHi\n", &json!({})).unwrap();
+    assert_eq!(
+        sets,
+        json!([{"name": "A", "values": [{"variable": "showBadge", "kind": "visibility", "value": false}, {"variable": "headline", "kind": "text", "value": "Hi"}]}])
+    );
+    assert!(doc(&s).variables.is_empty());
+    assert!(data_sets_from_text(doc(&s), &defs, "", &json!({})).is_err());
+}
+
+#[test]
+fn preview_applies_without_touching_the_document() {
+    let (s, _p, badge, title) = session();
+    let defs = json!([{"name": "showBadge", "layer": badge.0, "type": "visibility"}, {"name": "headline", "layer": title.0, "type": "textReplacement"}]);
+    let set = json!({"name": "A", "values": [{"variable": "showBadge", "kind": "visibility", "value": false}, {"variable": "headline", "kind": "text", "value": "Preview"}]});
+    let history = s.active().unwrap().history.entries().len();
+    let shown = preview_data_set(&s, doc(&s), &defs, &set).unwrap();
+    assert!(!shown.layer(badge).unwrap().visible);
+    assert!(matches!(&shown.layer(title).unwrap().content, LayerContent::Text(t) if t.text == "Preview"));
+    assert!(doc(&s).layer(badge).unwrap().visible, "the document is unchanged");
+    assert_eq!(text_of(&s, title), "Old");
+    assert_eq!(s.active().unwrap().history.entries().len(), history, "no history step");
+    assert!(preview_data_set(&s, doc(&s), &json!([{"name": "x", "layer": u64::MAX, "type": "visibility"}]), &set).is_err());
+}

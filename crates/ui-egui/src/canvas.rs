@@ -1411,6 +1411,10 @@ pub(crate) fn display_doc(app: &mut PhotocraftApp, idx: usize) -> (std::sync::Ar
     if let Some(shown) = crate::solid_fill_ui::display_doc(app, idx) {
         return shown;
     }
+    // Variables dialog / Apply Data Set with Preview on: the shown data set applied.
+    if let Some(shown) = crate::variables_preview::display_doc(app, idx) {
+        return shown;
+    }
     if let Some(shown) = crate::pattern_fill_ui::display_doc(app, idx) {
         return shown;
     }

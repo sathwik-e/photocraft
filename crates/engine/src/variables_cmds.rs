@@ -112,7 +112,13 @@ fn set_vars(s: &mut Session, f: impl FnOnce(&mut Variables)) -> Result<()> {
 
 fn define(s: &mut Session, p: &Value) -> Result<Value> {
     let defs_in = p.get("defs").and_then(Value::as_array).ok_or_else(|| bad("image.variables.define", "need `defs`"))?;
-    let doc = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
+    let defs = parse_defs(&s.active().ok_or(EngineError::NoDocument)?.doc, defs_in)?;
+    set_vars(s, |v| v.defs = defs)?;
+    list(s)
+}
+
+/// Variable definitions from `image.variables.define`'s `defs`, checked against `doc`'s layers.
+fn parse_defs(doc: &Document, defs_in: &[Value]) -> Result<Vec<VariableDef>> {
     let mut defs = Vec::with_capacity(defs_in.len());
     for d in defs_in {
         let name = d.get("name").and_then(Value::as_str).ok_or_else(|| bad("image.variables.define", "a def needs `name`"))?;
@@ -142,12 +148,25 @@ fn define(s: &mut Session, p: &Value) -> Result<Value> {
         }
         defs.push(VariableDef { name: name.to_string(), layer, kind });
     }
-    set_vars(s, |v| v.defs = defs)?;
-    list(s)
+    Ok(defs)
 }
 
 fn data_sets(s: &mut Session, p: &Value) -> Result<Value> {
     let rows = p.get("dataSets").and_then(Value::as_array).ok_or_else(|| bad("image.variables.dataSets", "need `dataSets`"))?;
+    let sets = parse_sets(rows)?;
+    let append = p.get("append").and_then(Value::as_bool).unwrap_or(false);
+    set_vars(s, |v| {
+        if append {
+            v.data_sets.extend(sets);
+        } else {
+            v.data_sets = sets;
+        }
+    })?;
+    list(s)
+}
+
+/// Data sets from `image.variables.dataSets`'s `dataSets`.
+fn parse_sets(rows: &[Value]) -> Result<Vec<DataSet>> {
     let mut sets = Vec::with_capacity(rows.len());
     for r in rows {
         let name = r.get("name").and_then(Value::as_str).ok_or_else(|| bad("image.variables.dataSets", "a data set needs `name`"))?;
@@ -159,15 +178,7 @@ fn data_sets(s: &mut Session, p: &Value) -> Result<Value> {
         }
         sets.push(DataSet { name: name.to_string(), values });
     }
-    let append = p.get("append").and_then(Value::as_bool).unwrap_or(false);
-    set_vars(s, |v| {
-        if append {
-            v.data_sets.extend(sets);
-        } else {
-            v.data_sets = sets;
-        }
-    })?;
-    list(s)
+    Ok(sets)
 }
 
 /// Apply one data set's values to the document (visibility, text, pixels). A history step.
@@ -311,17 +322,48 @@ fn import_data_sets(s: &mut Session, p: &Value) -> Result<Value> {
 /// The body of `file.import.variableDataSets` over CSV text already read: automation reads the
 /// file beneath its read root and hands the text over (#3216).
 pub fn import_data_sets_text(s: &mut Session, text: &str, p: &Value) -> Result<Value> {
+    let vars = s.active().ok_or(EngineError::NoDocument)?.doc.variables.clone();
+    let sets = csv_sets(&vars, text, p)?;
+    let n = sets.len();
+    // Photoshop's Import Data Set › Replace Existing Data Sets (on unless asked otherwise).
+    let replace = p.get("replace").and_then(Value::as_bool).unwrap_or(true);
+    set_vars(s, |v| {
+        if replace {
+            v.data_sets = sets;
+        } else {
+            for mut set in sets {
+                set.name = unique_set_name(&v.data_sets, &set.name);
+                v.data_sets.push(set);
+            }
+        }
+    })?;
+    Ok(json!({"imported": n}))
+}
+
+/// `name`, or `name 2`, `name 3`… when a data set already has it.
+fn unique_set_name(sets: &[DataSet], name: &str) -> String {
+    let taken = |n: &str| sets.iter().any(|s| s.name == n);
+    if !taken(name) {
+        return name.to_string();
+    }
+    (2..).map(|i| format!("{name} {i}")).find(|n| !taken(n)).unwrap_or_else(|| name.to_string())
+}
+
+/// Data sets read from comma- or tab-delimited text for the variables in `vars`: the header row
+/// names the variables, each later row is a data set. `firstColumnNames` (Photoshop's "Use First
+/// Column For Data Set Names") makes the first column the names; without it, an empty or
+/// `DataSet` first header cell does.
+fn csv_sets(vars: &Variables, text: &str, p: &Value) -> Result<Vec<DataSet>> {
     // Excel's "CSV UTF-8" starts with a byte order mark that is not part of the first header cell.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     // Photoshop reads comma- or tab-delimited text: without a `delimiter`, the header decides.
     let delim = p.get("delimiter").and_then(Value::as_str).and_then(|d| d.bytes().next()).unwrap_or_else(|| detect_delimiter(text));
-    let vars = s.active().ok_or(EngineError::NoDocument)?.doc.variables.clone();
     let mut records = csv_records(text).filter(|r| !r.trim().is_empty());
     let header: Vec<String> = records.next().map(|h| split_csv(h, delim)).unwrap_or_default();
-    if header.is_empty() {
+    let Some(first) = header.first() else {
         return Err(bad("file.import.variableDataSets", "empty CSV"));
-    }
-    let named = header[0].trim().is_empty() || header[0].eq_ignore_ascii_case("dataset");
+    };
+    let named = p.get("firstColumnNames").and_then(Value::as_bool).unwrap_or_else(|| first.trim().is_empty() || first.eq_ignore_ascii_case("dataset"));
     let mut sets = Vec::new();
     for (row, record) in records.enumerate() {
         let cells = split_csv(record, delim);
@@ -344,9 +386,29 @@ pub fn import_data_sets_text(s: &mut Session, text: &str, p: &Value) -> Result<V
         }
         sets.push(DataSet { name, values });
     }
-    let n = sets.len();
-    set_vars(s, |v| v.data_sets = sets)?;
-    Ok(json!({"imported": n}))
+    Ok(sets)
+}
+
+/// The Variables dialog's Import…: data sets read from `text` for the definitions the dialog
+/// holds (`defs`, as `image.variables.define` takes them, maybe not saved yet), in
+/// `image.variables.dataSets`'s shape. Nothing is stored: the dialog's OK saves them.
+pub fn data_sets_from_text(doc: &Document, defs: &Value, text: &str, p: &Value) -> Result<Value> {
+    let defs = parse_defs(doc, defs.as_array().map(Vec::as_slice).unwrap_or_default())?;
+    let vars = Variables { defs, ..Default::default() };
+    Ok(sets_json(&csv_sets(&vars, text, p)?))
+}
+
+/// The Variables dialog's Preview: `doc` with `set` applied for the definitions `defs` (both in
+/// the commands' shapes), without a history step. An untrusted session's gate judges each image
+/// it would read, as Apply Data Set does.
+pub fn preview_data_set(s: &Session, doc: &Document, defs: &Value, set: &Value) -> Result<Document> {
+    let defs = parse_defs(doc, defs.as_array().map(Vec::as_slice).unwrap_or_default())?;
+    let set = parse_sets(std::slice::from_ref(set))?.pop().ok_or_else(|| bad("image.applyDataSet", "no data set"))?;
+    authorize_pixel_paths(s, &set)?;
+    let vars = Variables { defs, ..Default::default() };
+    let mut shown = doc.clone();
+    apply_to_doc(&mut shown, &vars, &set)?;
+    Ok(shown)
 }
 
 /// Tab when the header row has more tabs than commas, else comma.
@@ -496,18 +558,24 @@ pub fn export_data_sets_with(s: &Session, p: &Value, mut write: impl FnMut(&str,
     Ok(written)
 }
 
+fn sets_json(sets: &[DataSet]) -> Value {
+    sets.iter()
+        .map(|ds| {
+            json!({
+                "name": ds.name,
+                "values": ds.values.iter().map(|dv| merged(json!({"variable": dv.variable}), value_json(&dv.value))).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 fn list(s: &mut Session) -> Result<Value> {
     let v = &s.active().ok_or(EngineError::NoDocument)?.doc.variables;
     Ok(json!({
         "defs": v.defs.iter().map(|d| {
             merged(json!({"name": d.name, "layer": d.layer.0}), kind_json(&d.kind))
         }).collect::<Vec<_>>(),
-        "dataSets": v.data_sets.iter().map(|ds| json!({
-            "name": ds.name,
-            "values": ds.values.iter().map(|dv| {
-                merged(json!({"variable": dv.variable}), value_json(&dv.value))
-            }).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
+        "dataSets": sets_json(&v.data_sets),
         "active": v.active,
     }))
 }
@@ -545,7 +613,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "file.import.variableDataSets",
             "Variable Data Sets…",
             &["File", "Import"],
-            "{path, delimiter?} → {imported}: CSV header = variable names, each row a data set (first column may be the data-set name)",
+            "{path, delimiter?(comma or tab, from the header), firstColumnNames?, replace?=true} → {imported}: CSV header = variable names, each row a data set; firstColumnNames makes the first column the data-set names (default: when its header is empty or `DataSet`); replace:false adds to the existing data sets",
             |s, p| import_data_sets(s, p)
         ),
         spec!(

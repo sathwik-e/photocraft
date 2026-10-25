@@ -248,6 +248,7 @@ pub mod type_panels_ui;
 pub mod type_tool;
 mod type_transform;
 pub mod updates_ui;
+mod variables_preview;
 mod variables_ui;
 pub mod vector_ui;
 pub mod view_cmds;
@@ -886,6 +887,7 @@ pub struct PhotocraftApp {
     /// Live Layer Style dialog preview: (key over revision + style fields, preview or validation error).
     pub(crate) style_preview: Option<(u64, Result<std::sync::Arc<Document>, String>)>,
     pub(crate) solid_fill_preview: Option<solid_fill_ui::Preview>,
+    pub(crate) variables_preview: Option<variables_preview::Preview>,
     /// Live Pattern Fill dialog preview (pattern_fill_ui).
     pub(crate) pattern_fill_preview: Option<pattern_fill_ui::Preview>,
     /// Shape fill Color Picker preview (shape_fill_ui).
@@ -1131,6 +1133,7 @@ impl PhotocraftApp {
             style_preview: None,
             text_style_preview: None,
             solid_fill_preview: None,
+            variables_preview: None,
             pattern_fill_preview: None,
             shape_fill_preview: None,
             distort: Default::default(),

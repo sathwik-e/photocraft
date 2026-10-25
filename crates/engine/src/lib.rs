@@ -133,7 +133,7 @@ pub mod type_spell_cmds;
 pub mod type_styles_cmds;
 pub mod updates_cmds;
 mod variables_cmds;
-pub use variables_cmds::{export_data_sets_with, import_data_sets_text};
+pub use variables_cmds::{data_sets_from_text, export_data_sets_with, import_data_sets_text, preview_data_set};
 pub mod vector_cmds;
 mod video_cmds;
 pub use video_cmds::render_video_with;

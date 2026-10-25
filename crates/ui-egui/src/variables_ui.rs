@@ -9,6 +9,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::PhotocraftApp;
+use crate::file_dialog::{FileDialogAnswer, FileDialogRequest};
 use crate::state::DialogKind;
 use crate::theme::Tokens;
 
@@ -69,29 +70,127 @@ pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<
     match id {
         "image.variables.define" | "image.variables.dataSets" if !has_params => {
             let page = if id.ends_with("dataSets") { "dataSets" } else { "define" };
-            let mut f = Map::new();
-            let state = app.session.active().map(|st| crate::variables_ui::to_state(&st.doc.variables)).unwrap_or_else(|| json!({"defs": [], "dataSets": []}));
-            // Snapshot at open so Alt+Reset restores the document's variables.
-            f.insert("__variablesOrig".into(), state.clone());
-            f.insert("__variables".into(), state);
-            f.insert("__page".into(), json!(page));
-            f.insert("__label".into(), json!("Variables"));
-            Some(Ok(json!({"dialog": app.ui.open_dialog(DialogKind::Command, f)})))
+            Some(Ok(open(app, page, "Variables", false)))
         }
-        "image.applyDataSet" if !has_params => {
-            // No data set named: Photoshop's Apply Data Set dialog, a list to pick one from.
-            let mut f = Map::new();
-            let vars = app.session.active().map(|st| (crate::variables_ui::to_state(&st.doc.variables), st.doc.variables.active));
-            let (state, active) = vars.unwrap_or_else(|| (json!({"defs": [], "dataSets": []}), None));
-            f.insert("__variablesOrig".into(), state.clone());
-            f.insert("__variables".into(), state);
-            f.insert("__page".into(), json!("apply"));
-            f.insert("__cur".into(), json!(active.unwrap_or(0)));
-            f.insert("__label".into(), json!("Apply Data Set"));
-            Some(Ok(json!({"dialog": app.ui.open_dialog(DialogKind::Command, f)})))
-        }
+        // No data set named: Photoshop's Apply Data Set dialog, a list to pick one from, with
+        // Preview on.
+        "image.applyDataSet" if !has_params => Some(Ok(open(app, "apply", "Apply Data Set", true))),
         _ => None,
     }
+}
+
+/// Open the dialog on `page` for the active document's variables.
+fn open(app: &mut PhotocraftApp, page: &str, label: &str, preview: bool) -> Value {
+    let mut f = Map::new();
+    let vars = app.session.active().map(|st| (to_state(&st.doc.variables), st.doc.variables.active, st.doc.id.0));
+    let (state, active, document) = vars.unwrap_or_else(|| (json!({"defs": [], "dataSets": []}), None, 0));
+    // Snapshot at open so Alt+Reset restores the document's variables.
+    f.insert("__variablesOrig".into(), state.clone());
+    f.insert("__variables".into(), state);
+    f.insert("__page".into(), json!(page));
+    f.insert("__cur".into(), json!(active.unwrap_or(0)));
+    // The document the dialog edits: Preview and Import read it, whichever is active later.
+    f.insert("__document".into(), json!(document));
+    f.insert("__preview".into(), json!(preview));
+    f.insert("__importFirstColumn".into(), json!(true));
+    f.insert("__importReplace".into(), json!(true));
+    f.insert("__label".into(), json!(label));
+    json!({"dialog": app.ui.open_dialog(DialogKind::Command, f)})
+}
+
+/// Whether the canvas previews the shown data set: Preview on, on the Data Sets page or in
+/// Apply Data Set.
+pub fn previewing(fields: &Map<String, Value>) -> bool {
+    matches!(fields.get("__page").and_then(Value::as_str), Some("dataSets" | "apply")) && fields.get("__preview").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// The Preview check box, and why the preview can't be shown when it can't.
+fn preview_row(app: &PhotocraftApp, ui: &mut egui::Ui, fields: &mut Map<String, Value>, id: u64) {
+    let mut on = fields.get("__preview").and_then(Value::as_bool).unwrap_or(false);
+    if ui.checkbox(&mut on, tl!("Preview")).changed() {
+        fields.insert("__preview".into(), json!(on));
+    }
+    if on && let Some(e) = crate::variables_preview::error(app, id) {
+        ui.colored_label(ui.visuals().error_fg_color, e);
+    }
+}
+
+/// What the Data Sets page asked for this frame: a file dialog the body opens once the frame's
+/// edits are saved.
+#[derive(Default)]
+struct Requests {
+    /// Choose an image for this Pixel Replacement variable of the shown data set.
+    pick_image: Option<String>,
+    /// Import data sets from a text file.
+    import: bool,
+}
+
+/// Images a Pixel Replacement value can name.
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "psd", "psb", "bmp", "gif", "webp", "tga"];
+
+/// Choose… for a Pixel Replacement value: the picked path lands in dialog `id`'s data set `cur`.
+fn pick_image(app: &mut PhotocraftApp, id: u64, cur: usize, variable: String) -> Result<Value, String> {
+    let initial_dir = crate::file_dialog::last_used_dir(&app.ui.recent_files);
+    let extensions = Some(IMAGE_EXTS.iter().map(|e| e.to_string()).collect());
+    app.ask_file(FileDialogRequest::Open { multiple: false, initial_dir, extensions }, move |app, answer| {
+        let FileDialogAnswer::Paths(paths) = answer else { return Err(tl!("Pixel Replacement reads image files from disk").to_string()) };
+        let path = paths.into_iter().next().ok_or(crate::file_dialog::CANCELLED)?;
+        let d = app.ui.dialog_mut(id).ok_or("the dialog was closed")?;
+        let mut state = normalize(d.fields.get("__variables").unwrap_or(&Value::Null));
+        set_value(&mut state, cur, &variable, json!({"variable": variable, "kind": "pixels", "value": path}));
+        d.fields.insert("__variables".into(), state);
+        Ok(Value::Null)
+    })
+}
+
+/// Store `value` as `variable`'s value in data set `cur` of the dialog state.
+fn set_value(state: &mut Value, cur: usize, variable: &str, value: Value) {
+    let Some(values) = state.get_mut("dataSets").and_then(Value::as_array_mut).and_then(|s| s.get_mut(cur)).and_then(|s| s.get_mut("values")).and_then(Value::as_array_mut) else {
+        return;
+    };
+    match values.iter_mut().find(|v| v.get("variable").and_then(Value::as_str) == Some(variable)) {
+        Some(v) => *v = value,
+        None => values.push(value),
+    }
+}
+
+/// Import…: read a comma- or tab-delimited file into dialog `id`, for the definitions it holds.
+fn import(app: &mut PhotocraftApp, id: u64) -> Result<Value, String> {
+    app.pick_file_bytes_filtered(&["csv", "txt", "tsv"], move |app, _name, bytes| {
+        let fields = app.ui.dialog_mut(id).ok_or("the dialog was closed")?.fields.clone();
+        let mut state = normalize(fields.get("__variables").unwrap_or(&Value::Null));
+        let document = fields.get("__document").and_then(Value::as_u64);
+        let doc = app.session.documents().iter().find(|d| Some(d.doc.id.0) == document).map(|d| d.doc.clone()).ok_or("the document was closed")?;
+        let first = fields.get("__importFirstColumn").and_then(Value::as_bool).unwrap_or(true);
+        let replace = fields.get("__importReplace").and_then(Value::as_bool).unwrap_or(true);
+        let text = String::from_utf8_lossy(&bytes);
+        let defs = state.get("defs").cloned().unwrap_or_else(|| json!([]));
+        let imported = photocraft_engine::data_sets_from_text(&doc, &defs, &text, &json!({"firstColumnNames": first})).map_err(|e| e.to_string())?;
+        let (state, cur) = merged_import(state.take(), imported, replace);
+        let d = app.ui.dialog_mut(id).ok_or("the dialog was closed")?;
+        d.fields.insert("__variables".into(), state);
+        d.fields.insert("__cur".into(), json!(cur));
+        Ok(Value::Null)
+    })
+}
+
+/// The dialog state with `imported` data sets in place of its own (`replace`) or after them,
+/// renamed apart from the ones there; and the first imported set's index.
+fn merged_import(mut state: Value, imported: Value, replace: bool) -> (Value, usize) {
+    let imported = imported.as_array().cloned().unwrap_or_default();
+    let mut sets = if replace { Vec::new() } else { state.get("dataSets").and_then(Value::as_array).cloned().unwrap_or_default() };
+    let first = sets.len();
+    for mut set in imported {
+        let name = set.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+        let taken = |n: &str, sets: &[Value]| sets.iter().any(|s| s.get("name").and_then(Value::as_str) == Some(n));
+        if taken(&name, &sets) {
+            let unique = (2..).map(|i| format!("{name} {i}")).find(|n| !taken(n, &sets)).unwrap_or(name);
+            set["name"] = json!(unique);
+        }
+        sets.push(set);
+    }
+    state["dataSets"] = Value::Array(sets);
+    (state, first)
 }
 
 /// Serialise the document's variables into the dialog's editable JSON shape.
@@ -163,7 +262,7 @@ const ALIGNS: &[(&str, &str)] = &[
 ];
 
 /// Render the dialog. Mutates `fields["__variables"]` and `fields["__page"]`.
-pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, fields: &mut Map<String, Value>) {
+pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, fields: &mut Map<String, Value>, id: u64) {
     let t = Tokens::get(ui.ctx());
     let layers = layer_options(app);
     let mut state = normalize(fields.get("__variables").unwrap_or(&Value::Null));
@@ -172,6 +271,7 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, fields: &mut Map<String,
     ui.set_min_width(420.0);
     if page == "apply" {
         apply_page(ui, &mut state, fields);
+        preview_row(app, ui, fields, id);
         fields.insert("__variables".into(), state);
         return;
     }
@@ -191,7 +291,28 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, fields: &mut Map<String,
     } else if page == "define" {
         define_page(ui, &t, &layers, &mut state);
     } else {
-        data_sets_page(ui, &t, &mut state, fields);
+        let mut requests = Requests::default();
+        data_sets_page(ui, &t, &mut state, fields, &mut requests);
+        preview_row(app, ui, fields, id);
+        if requests.pick_image.is_some() || requests.import {
+            // The file dialog's answer lands in the dialog's own fields: save this frame's edits first.
+            fields.insert("__variables".into(), state.clone());
+            fields.insert("__page".into(), json!(page));
+            if let Some(d) = app.ui.dialog_mut(id) {
+                d.fields = fields.clone();
+            }
+            let cur = data_set_index(fields, state.get("dataSets").and_then(Value::as_array).map_or(0, Vec::len));
+            let r = match requests.pick_image {
+                Some(variable) => pick_image(app, id, cur, variable),
+                None => import(app, id),
+            };
+            if let Err(e) = r
+                && e != crate::file_dialog::CANCELLED
+            {
+                app.ui.status = e;
+                app.ui.status_error = true;
+            }
+        }
     }
 
     fields.insert("__variables".into(), state);
@@ -279,7 +400,7 @@ fn data_set_index(fields: &Map<String, Value>, len: usize) -> usize {
     fields.get("__cur").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok()).filter(|&i| i < len).unwrap_or(0)
 }
 
-fn data_sets_page(ui: &mut egui::Ui, _t: &Tokens, state: &mut Value, fields: &mut Map<String, Value>) {
+fn data_sets_page(ui: &mut egui::Ui, _t: &Tokens, state: &mut Value, fields: &mut Map<String, Value>, requests: &mut Requests) {
     let def_meta: Vec<(String, String)> = state
         .get("defs")
         .and_then(Value::as_array)
@@ -373,8 +494,11 @@ fn data_sets_page(ui: &mut egui::Ui, _t: &Tokens, state: &mut Value, fields: &mu
                     "pixelReplacement" => {
                         let mut p = values[i].get("value").and_then(Value::as_str).unwrap_or("").to_string();
                         // Empty is Photoshop's "Do Not Replace".
-                        if ui.add(egui::TextEdit::singleline(&mut p).hint_text(tl!("Do Not Replace")).desired_width(240.0)).changed() {
+                        if ui.add(egui::TextEdit::singleline(&mut p).hint_text(tl!("Do Not Replace")).desired_width(200.0)).changed() {
                             values[i]["value"] = json!(p);
+                        }
+                        if ui.button(tl!("Choose…")).on_hover_text(tl!("Select an image file")).clicked() {
+                            requests.pick_image = Some(vname.clone());
                         }
                     }
                     _ => {
@@ -395,6 +519,18 @@ fn data_sets_page(ui: &mut egui::Ui, _t: &Tokens, state: &mut Value, fields: &mu
     if let Some(i) = data_set_table(ui, "vars-table", &def_meta, sets, cur) {
         cur = i;
     }
+    // Photoshop's Import Data Set options, then the file.
+    ui.horizontal(|ui| {
+        if ui.button(tl!("Import…")).on_hover_text(tl!("Import data sets from a comma- or tab-delimited text file")).clicked() {
+            requests.import = true;
+        }
+        for (key, label) in [("__importFirstColumn", tl!("Use First Column For Data Set Names")), ("__importReplace", tl!("Replace Existing Data Sets"))] {
+            let mut on = fields.get(key).and_then(Value::as_bool).unwrap_or(true);
+            if ui.checkbox(&mut on, label).changed() {
+                fields.insert(key.into(), json!(on));
+            }
+        }
+    });
     fields.insert("__cur".into(), json!(cur));
 }
 
@@ -610,6 +746,102 @@ mod tests {
         let st = app.session.active().unwrap();
         assert_eq!(st.doc.variables.active, Some(1));
         assert!(!st.doc.layer(photocraft_doc::LayerId(layer)).unwrap().visible);
+    }
+
+    type Open = std::rc::Rc<std::cell::RefCell<Vec<(FileDialogRequest, crate::file_dialog::FileDialogReply)>>>;
+
+    /// An app whose file dialogs wait for the test, with a document holding a type layer
+    /// ("title") and a pixel layer ("photo") bound to variables, and one data set.
+    fn template() -> (PhotocraftApp, Open, egui::Context, u64, u64) {
+        let open: Open = Default::default();
+        let held = open.clone();
+        let services = crate::Services { file_dialog: Some(Box::new(move |request, _, reply| held.borrow_mut().push((request, reply)))), ..Default::default() };
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+        app.run("file.new", json!({"width": 40, "height": 30})).unwrap();
+        let photo = app.run("layer.new.layer", json!({"name": "photo"})).unwrap()["layer"].as_u64().unwrap();
+        app.run("type.create", json!({"x": 2, "y": 20, "text": "Old", "size": 12})).unwrap();
+        let title = app.session.active().unwrap().active_layer.unwrap().0;
+        let defs = json!([{"name": "title", "layer": title, "type": "textReplacement"}, {"name": "photo", "layer": photo, "type": "pixelReplacement"}]);
+        app.run("image.variables.define", json!({"defs": defs})).unwrap();
+        app.run("image.variables.dataSets", json!({"dataSets": [{"name": "A", "values": [{"variable": "title", "kind": "text", "value": "New"}]}]})).unwrap();
+        (app, open, egui::Context::default(), title, photo)
+    }
+
+    fn answer(app: &mut PhotocraftApp, ctx: &egui::Context, open: &Open, answer: FileDialogAnswer) {
+        app.poll_file_dialog(ctx, None);
+        let (_, reply) = open.borrow_mut().pop().expect("a dialog is open");
+        std::thread::spawn(move || reply.send(Some(answer))).join().unwrap();
+        app.poll_file_dialog(ctx, None);
+    }
+
+    fn sets(app: &mut PhotocraftApp, d: u64) -> Value {
+        app.ui.dialog_mut(d).unwrap().fields["__variables"]["dataSets"].clone()
+    }
+
+    #[test]
+    fn import_and_choose_fill_the_dialog_not_the_document() {
+        let (mut app, open, ctx, _, _) = template();
+        let d = menu(&mut app, "image.variables.dataSets", &json!({})).unwrap().unwrap()["dialog"].as_u64().unwrap();
+        // Defaults: first column names the sets, replacing the dialog's.
+        import(&mut app, d).unwrap();
+        answer(&mut app, &ctx, &open, FileDialogAnswer::Contents("sets.tsv".into(), b"name\ttitle\nB\tHello\n".to_vec()));
+        assert_eq!(sets(&mut app, d), json!([{"name": "B", "values": [{"variable": "title", "kind": "text", "value": "Hello"}]}]));
+        app.ui.dialog_mut(d).unwrap().fields.insert("__importReplace".into(), json!(false));
+        import(&mut app, d).unwrap();
+        answer(&mut app, &ctx, &open, FileDialogAnswer::Contents("sets.csv".into(), b"name,title\nB,Again\n".to_vec()));
+        let names: Vec<Value> = sets(&mut app, d).as_array().unwrap().iter().map(|s| s["name"].clone()).collect();
+        assert_eq!(names, [json!("B"), json!("B 2")]);
+        assert_eq!(app.ui.dialog_mut(d).unwrap().fields["__cur"], 1, "the first imported set is shown");
+
+        pick_image(&mut app, d, 1, "photo".into()).unwrap();
+        app.poll_file_dialog(&ctx, None);
+        assert!(matches!(open.borrow().as_slice(), [(FileDialogRequest::Open { multiple: false, extensions: Some(e), .. }, _)] if e.iter().any(|x| x == "png")));
+        // Cancelled: the value stays empty.
+        let (_, reply) = open.borrow_mut().pop().unwrap();
+        std::thread::spawn(move || reply.send(None)).join().unwrap();
+        app.poll_file_dialog(&ctx, None);
+        assert!(!sets(&mut app, d)[1]["values"].as_array().unwrap().iter().any(|v| v["variable"] == "photo"));
+        pick_image(&mut app, d, 1, "photo".into()).unwrap();
+        answer(&mut app, &ctx, &open, FileDialogAnswer::Paths(vec!["/pics/a.png".into()]));
+        assert!(sets(&mut app, d)[1]["values"].as_array().unwrap().contains(&json!({"variable": "photo", "kind": "pixels", "value": "/pics/a.png"})));
+        // Nothing reached the document until OK.
+        let doc_sets: Vec<String> = app.session.active().unwrap().doc.variables.data_sets.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(doc_sets, ["A"]);
+        crate::dialogs::confirm(&mut app, d).unwrap();
+        assert_eq!(app.session.active().unwrap().doc.variables.data_sets.len(), 2);
+    }
+
+    #[test]
+    fn preview_shows_the_set_without_changing_the_document() {
+        let (mut app, _open, _ctx, title, _) = template();
+        let d = menu(&mut app, "image.applyDataSet", &json!({})).unwrap().unwrap()["dialog"].as_u64().unwrap();
+        let text = |doc: &photocraft_doc::Document| match &doc.layer(photocraft_doc::LayerId(title)).unwrap().content {
+            photocraft_doc::LayerContent::Text(t) => t.text.clone(),
+            _ => String::new(),
+        };
+        let (shown, key) = crate::variables_preview::display_doc(&mut app, 0).expect("Apply Data Set previews by default");
+        assert_eq!(text(&shown), "New");
+        assert_eq!(text(&app.session.active().unwrap().doc), "Old");
+        assert_eq!(crate::variables_preview::display_doc(&mut app, 0).unwrap().1, key, "cached while nothing changes");
+        // A bad image path: no preview, and the dialog says why.
+        let fields = &mut app.ui.dialog_mut(d).unwrap().fields;
+        fields["__variables"]["dataSets"][0]["values"] = json!([{"variable": "photo", "kind": "pixels", "value": "/no/such/image.png"}]);
+        assert!(crate::variables_preview::display_doc(&mut app, 0).is_none());
+        assert!(crate::variables_preview::error(&app, d).is_some());
+        app.ui.dialog_mut(d).unwrap().fields.insert("__preview".into(), json!(false));
+        assert!(crate::variables_preview::display_doc(&mut app, 0).is_none(), "Preview off");
+        app.ui.close_dialog(d);
+        assert!(crate::variables_preview::display_doc(&mut app, 0).is_none());
+        assert!(app.variables_preview.is_none(), "closing drops the preview");
+    }
+
+    #[test]
+    fn set_value_replaces_or_adds_and_ignores_missing_sets() {
+        let mut s = json!({"dataSets": [{"values": [{"variable": "a", "value": 1}]}]});
+        set_value(&mut s, 0, "a", json!({"variable": "a", "value": 2}));
+        set_value(&mut s, 0, "b", json!({"variable": "b", "value": 3}));
+        set_value(&mut s, 9, "c", json!({"variable": "c"}));
+        assert_eq!(s, json!({"dataSets": [{"values": [{"variable": "a", "value": 2}, {"variable": "b", "value": 3}]}]}));
     }
 
     #[test]
