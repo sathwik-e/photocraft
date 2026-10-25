@@ -652,3 +652,51 @@ fn exported_data_sets_keep_the_character_style() {
     assert_eq!((got.weight, got.italic, got.underline), (style.weight, style.italic, style.underline));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn empty_pixel_path_keeps_the_layer() {
+    let (mut s, photo, badge, _t) = session();
+    s.execute(
+        "image.variables.define",
+        json!({"defs": [{"name": "img", "layer": photo.0, "type": "pixelReplacement"}, {"name": "show", "layer": badge.0, "type": "visibility"}]}),
+    )
+    .unwrap();
+    let values = json!([{"variable": "img", "kind": "pixels", "value": " "}, {"variable": "show", "kind": "visibility", "value": false}]);
+    s.execute("image.variables.dataSets", json!({"dataSets": [{"name": "A", "values": values}]})).unwrap();
+    let before = doc(&s).layer(photo).unwrap().surface().unwrap().content_bounds();
+    s.execute("image.applyDataSet", json!({"name": "A"})).unwrap();
+    assert_eq!(doc(&s).layer(photo).unwrap().surface().unwrap().content_bounds(), before, "Do Not Replace");
+    assert!(!doc(&s).layer(badge).unwrap().visible, "the other values still apply");
+}
+
+#[test]
+fn tab_delimited_import_is_detected() {
+    let (mut s, _p, badge, title) = session();
+    s.execute(
+        "image.variables.define",
+        json!({"defs": [{"name": "showBadge", "layer": badge.0, "type": "visibility"}, {"name": "headline", "layer": title.0, "type": "textReplacement"}]}),
+    )
+    .unwrap();
+    let dir = tmp("tsv");
+    let f = format!("{dir}/sets.tsv");
+    std::fs::write(&f, "DataSet\tshowBadge\theadline\nA\tfalse\tHi, there\n").unwrap();
+    s.execute("file.import.variableDataSets", json!({"path": f})).unwrap();
+    s.execute("image.applyDataSet", json!({"name": "A"})).unwrap();
+    assert!(!doc(&s).layer(badge).unwrap().visible);
+    assert_eq!(text_of(&s, title), "Hi, there", "a comma inside a tab-delimited cell is text");
+}
+
+#[test]
+fn define_rejects_what_photoshop_does_not_offer() {
+    let (mut s, photo, badge, title) = session();
+    let define = |s: &mut Session, defs: Value| s.execute("image.variables.define", json!({"defs": defs}));
+    let err = |r: Result<Value>| r.unwrap_err().to_string();
+    assert!(err(define(&mut s, json!([{"name": " ", "layer": badge.0, "type": "visibility"}]))).contains("empty"));
+    assert!(err(define(&mut s, json!([{"name": "t", "layer": photo.0, "type": "textReplacement"}]))).contains("type layer"));
+    assert!(err(define(&mut s, json!([{"name": "p", "layer": title.0, "type": "pixelReplacement"}]))).contains("pixel layer"));
+    let two_visibility = json!([{"name": "a", "layer": badge.0, "type": "visibility"}, {"name": "b", "layer": badge.0, "type": "visibility"}]);
+    assert!(err(define(&mut s, two_visibility)).contains("visibility variable"));
+    // One Visibility and one replacement variable on the same layer is fine.
+    define(&mut s, json!([{"name": "show", "layer": title.0, "type": "visibility"}, {"name": "head", "layer": title.0, "type": "textReplacement"}])).unwrap();
+    assert_eq!(doc(&s).variables.defs.len(), 2, "a rejected define leaves the previous definitions");
+}

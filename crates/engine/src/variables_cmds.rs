@@ -116,13 +116,29 @@ fn define(s: &mut Session, p: &Value) -> Result<Value> {
     let mut defs = Vec::with_capacity(defs_in.len());
     for d in defs_in {
         let name = d.get("name").and_then(Value::as_str).ok_or_else(|| bad("image.variables.define", "a def needs `name`"))?;
-        let layer = LayerId(d.get("layer").and_then(Value::as_u64).ok_or_else(|| bad("image.variables.define", "a def needs `layer`"))?);
-        if doc.layer(layer).is_none() {
-            return Err(EngineError::NoLayer(layer));
+        if name.trim().is_empty() {
+            return Err(bad("image.variables.define", "a variable name can't be empty"));
         }
+        let layer = LayerId(d.get("layer").and_then(Value::as_u64).ok_or_else(|| bad("image.variables.define", "a def needs `layer`"))?);
+        let Some(content) = doc.layer(layer).map(|l| &l.content) else {
+            return Err(EngineError::NoLayer(layer));
+        };
         let kind = parse_kind(d).ok_or_else(|| bad("image.variables.define", "a def needs a valid `type`"))?;
+        // As in Photoshop, Text Replacement is offered for type layers and Pixel Replacement for
+        // pixel layers only: on any other layer applying the variable would do nothing.
+        match (&kind, content) {
+            (VarKind::TextReplacement, LayerContent::Text(_)) | (VarKind::PixelReplacement { .. }, LayerContent::Raster(_)) | (VarKind::Visibility, _) => {}
+            (VarKind::TextReplacement, _) => return Err(bad("image.variables.define", format!("`{name}`: Text Replacement needs a type layer"))),
+            (VarKind::PixelReplacement { .. }, _) => return Err(bad("image.variables.define", format!("`{name}`: Pixel Replacement needs a pixel layer"))),
+        }
         if defs.iter().any(|e: &VariableDef| e.name == name) {
             return Err(bad("image.variables.define", format!("duplicate variable `{name}`")));
+        }
+        // A layer has at most one Visibility and one replacement variable, as in Photoshop.
+        let replaces = |k: &VarKind| !matches!(k, VarKind::Visibility);
+        if defs.iter().any(|e: &VariableDef| e.layer == layer && replaces(&e.kind) == replaces(&kind)) {
+            let what = if replaces(&kind) { "replacement" } else { "visibility" };
+            return Err(bad("image.variables.define", format!("`{name}`: the layer already has a {what} variable")));
         }
         defs.push(VariableDef { name: name.to_string(), layer, kind });
     }
@@ -183,6 +199,8 @@ fn apply_to_doc(doc: &mut Document, vars: &Variables, set: &DataSet) -> Result<(
                     crate::type_cmds::refresh_at(dpi, format, t);
                 }
             }
+            // An empty path is Photoshop's "Do Not Replace": the layer keeps its pixels.
+            (VarKind::PixelReplacement { .. }, VarValue::Pixels(path)) if path.trim().is_empty() => {}
             (VarKind::PixelReplacement { method, align, clip }, VarValue::Pixels(path)) => {
                 replace_pixels(doc, def.layer, path, *method, *align, *clip)?;
             }
@@ -248,7 +266,9 @@ fn replace_pixels(doc: &mut Document, layer: LayerId, path: &str, method: PixelM
 fn authorize_pixel_paths(s: &Session, set: &DataSet) -> Result<()> {
     if let Some(auth) = s.authorize {
         for dv in &set.values {
-            if let VarValue::Pixels(path) = &dv.value {
+            if let VarValue::Pixels(path) = &dv.value
+                && !path.trim().is_empty()
+            {
                 auth("image.applyDataSet", &json!({"path": path}))?;
             }
         }
@@ -291,9 +311,10 @@ fn import_data_sets(s: &mut Session, p: &Value) -> Result<Value> {
 /// The body of `file.import.variableDataSets` over CSV text already read: automation reads the
 /// file beneath its read root and hands the text over (#3216).
 pub fn import_data_sets_text(s: &mut Session, text: &str, p: &Value) -> Result<Value> {
-    let delim = p.get("delimiter").and_then(Value::as_str).and_then(|d| d.bytes().next()).unwrap_or(b',');
     // Excel's "CSV UTF-8" starts with a byte order mark that is not part of the first header cell.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // Photoshop reads comma- or tab-delimited text: without a `delimiter`, the header decides.
+    let delim = p.get("delimiter").and_then(Value::as_str).and_then(|d| d.bytes().next()).unwrap_or_else(|| detect_delimiter(text));
     let vars = s.active().ok_or(EngineError::NoDocument)?.doc.variables.clone();
     let mut records = csv_records(text).filter(|r| !r.trim().is_empty());
     let header: Vec<String> = records.next().map(|h| split_csv(h, delim)).unwrap_or_default();
@@ -326,6 +347,13 @@ pub fn import_data_sets_text(s: &mut Session, text: &str, p: &Value) -> Result<V
     let n = sets.len();
     set_vars(s, |v| v.data_sets = sets)?;
     Ok(json!({"imported": n}))
+}
+
+/// Tab when the header row has more tabs than commas, else comma.
+fn detect_delimiter(text: &str) -> u8 {
+    let header = csv_records(text).find(|r| !r.trim().is_empty()).unwrap_or_default();
+    let count = |c: char| header.chars().filter(|&h| h == c).count();
+    if count('\t') > count(',') { b'\t' } else { b',' }
 }
 
 /// Split logical CSV records without changing line endings inside quoted fields.
